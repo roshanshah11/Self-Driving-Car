@@ -1,4 +1,4 @@
-# WhiteLine Track Detection and Mapping System
+# Autonomous Race Car with 2D Mapping System + Optimial Racing Line generation
 
 A robotics vision system for detecting and mapping white track boundaries using a Limelight camera. This system enables robots to build a map of a track marked by white boundary lines and generate an optimal racing path with speed profiles.
 

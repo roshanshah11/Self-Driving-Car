@@ -5,12 +5,11 @@ import numpy as np
 import threading
 import logging
 import cv2
+import requests
 
-# Import limelight modules with centralized connection utility
-import limelight
-from line_detection import limelightresults
-from line_detection.limelight_connection import connect_to_limelight, get_line_data, set_camera_params, switch_pipeline, disconnect
-from line_detection.detect_limelight import get_latest_image
+# Import consolidated line detection modules
+from line_detection.line_detector import LineDetector
+from line_detection.limelight_core import get_line_data, disconnect
 from visualization.web_visualizer import WebVisualizer
 
 # Configure logging
@@ -53,11 +52,10 @@ class Config:
         'error_log_cooldown': 20,         # How many iterations to wait before logging errors again
     }
 
-class LineDetector:
+class MainApplication:
     def __init__(self):
         # Initialize components
-        self.limelight_address = None
-        self.ll = None
+        self.line_detector = LineDetector()
         
         # For storing line detection data
         self.latest_left_line = None
@@ -70,41 +68,33 @@ class LineDetector:
             port=Config.NETWORK['web_port']
         )
         
-        # NetworkTables client for getting data from Limelight
-        self.nt_client = None
-        
     def setup(self):
         """Setup the system"""
         logger.info("Setting up white line detection system...")
         
         try:
-            # Connect to Limelight using the centralized connection utility
-            config = {
+            # Connect and configure the line detector
+            if not self.line_detector.connect():
+                logger.error("Failed to connect to line detector. Cannot continue.")
+                return False
+                
+            # Update detection parameters with our config values
+            self.line_detector.update_detection_params({
                 'exposure': Config.CAMERA['exposure'],
                 'brightness': Config.CAMERA['brightness'],
                 'gain': Config.CAMERA['gain'],
-                'pipeline': Config.CAMERA['pipeline'],
-                'threshold_min': Config.CAMERA['threshold_min'],
-                'request_timeout': Config.NETWORK['request_timeout']
-            }
+                'threshold_min': Config.CAMERA['threshold_min']
+            })
             
-            self.ll, self.limelight_address, self.nt_client = connect_to_limelight(config=config, use_nt=True, debug=True)
-            
-            if self.ll is None:
-                logger.error("Failed to connect to any Limelight cameras. Cannot continue.")
-                return False
-                
-            logger.info(f"Successfully connected to Limelight at {self.limelight_address}")
+            logger.info(f"Successfully connected to Limelight")
             
             # Connect Limelight to web visualizer
-            self.web_visualizer.set_limelight_address(self.limelight_address)
-            self.web_visualizer.set_limelight_instance(self.ll)
+            limelight_address = self.line_detector.manager.limelight_address
+            self.web_visualizer.set_limelight_address(limelight_address)
+            self.web_visualizer.set_limelight_instance(self.line_detector.manager.ll)
             
             # Set up a parameter update callback
             self.web_visualizer.set_param_update_callback(self.update_detection_params)
-            
-            # Configure Python-specific parameters
-            self.configure_python_parameters()
             
             # Start the data fetching thread
             self.start_data_fetching_thread()
@@ -119,44 +109,6 @@ class LineDetector:
             logger.error(f"Error during setup: {e}")
             return False
             
-    def configure_python_parameters(self):
-        """Configure Python-specific parameters for the vision pipeline"""
-        try:
-            # Add retry logic for HTTP requests
-            max_retries = Config.NETWORK['max_retries']
-            retry_delay = Config.NETWORK['retry_delay']
-            python_params = {
-                'threshold_min': Config.CAMERA['threshold_min']
-            }
-            
-            for attempt in range(max_retries):
-                try:
-                    # Send to Limelight Python config endpoint
-                    endpoint = Config.NETWORK['python_config_endpoint'].format(address=self.limelight_address)
-                    import requests
-                    response = requests.post(
-                        endpoint,
-                        json=python_params,
-                        timeout=Config.NETWORK['request_timeout']
-                    )
-                    if response.status_code == 200:
-                        logger.info("Python parameters set successfully")
-                        return True
-                    else:
-                        logger.warning(f"Failed to set Python parameters: {response.status_code}")
-                except Exception as e:
-                    logger.error(f"Error setting Python parameters (attempt {attempt+1}/{max_retries}): {e}")
-                    
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-            
-            logger.error("Failed to set Python parameters after all retries")
-            return False
-        except Exception as e:
-            logger.error(f"Error configuring Python parameters: {e}")
-            return False
-
     def start_data_fetching_thread(self):
         """Start a background thread to continuously fetch data from the Limelight"""
         def fetch_data_continuously():
@@ -169,85 +121,39 @@ class LineDetector:
             logger.info("Starting data fetching loop")
             while True:
                 try:
-                    # Get the llpython array directly from NetworkTables
-                    llpython = self.nt_client.getNumberArray('llpython', [0] * 8)
+                    # Use our line detector to get the latest lines
+                    left_line, right_line = self.line_detector.detect_lines()
                     
-                    if len(llpython) >= 8:
-                        with self.python_data_lock:
-                            # Format from pipeline: 
-                            # [left_detected(0/1), x1, y1, x2, y2, right_detected(0/1), x1, y1]
+                    with self.python_data_lock:
+                        self.latest_left_line = left_line
+                        self.latest_right_line = right_line
+                    
+                        # Only log when the lines change significantly
+                        if left_line is not None:
+                            if previous_left_line is None or not np.array_equal(np.array(left_line), np.array(previous_left_line)):
+                                logger.debug(f"Left line detected: {left_line}")
+                                previous_left_line = left_line
+                        elif previous_left_line is not None:
+                            logger.debug("Left line lost")
+                            previous_left_line = None
                             
-                            # Extract left line data
-                            if llpython[0] == 1:  # Left line detected
-                                self.latest_left_line = [
-                                    int(llpython[1]),  # x1
-                                    int(llpython[2]),  # y1
-                                    int(llpython[3]),  # x2
-                                    int(llpython[4])   # y2
-                                ]
-                                # Only log when the line changes significantly
-                                if previous_left_line is None or not np.array_equal(np.array(self.latest_left_line), np.array(previous_left_line)):
-                                    logger.debug(f"Left line detected: {self.latest_left_line}")
-                                    previous_left_line = self.latest_left_line
-                            else:
-                                if previous_left_line is not None:
-                                    logger.debug("Left line lost")
-                                    previous_left_line = None
-                                    
-                                self.latest_left_line = None
-                            
-                            # Extract right line data
-                            if llpython[5] == 1:  # Right line detected
-                                # For right line, we only get starting point (x1,y1)
-                                # Need to calculate end point
-                                right_x1 = int(llpython[6])
-                                right_y1 = int(llpython[7])
-                                
-                                # If left line exists, try to make right line parallel to left
-                                if self.latest_left_line is not None:
-                                    # Get direction vector of left line
-                                    left_x1, left_y1, left_x2, left_y2 = self.latest_left_line
-                                    left_dx = left_x2 - left_x1
-                                    left_dy = left_y2 - left_y1
-                                    
-                                    # Calculate length and unit vector
-                                    left_length = np.sqrt(left_dx**2 + left_dy**2)
-                                    if left_length > 0:
-                                        # Normalize to unit vector
-                                        left_dx /= left_length
-                                        left_dy /= left_length
-                                        
-                                        # Use same length for right line
-                                        right_x2 = int(right_x1 + left_dx * left_length)
-                                        right_y2 = int(right_y1 + left_dy * left_length)
-                                    else:
-                                        # If left line has 0 length, extend downward
-                                        right_x2 = right_x1
-                                        right_y2 = right_y1 + 100
-                                else:
-                                    # Without left line, extend downward
-                                    right_x2 = right_x1
-                                    right_y2 = right_y1 + 100
-                                
-                                self.latest_right_line = [right_x1, right_y1, right_x2, right_y2]
-                                
-                                # Only log when the line changes significantly
-                                if previous_right_line is None or not np.array_equal(np.array(self.latest_right_line), np.array(previous_right_line)):
-                                    logger.debug(f"Right line detected: {self.latest_right_line}")
-                                    previous_right_line = self.latest_right_line
-                            else:
-                                if previous_right_line is not None:
-                                    logger.debug("Right line lost")
-                                    previous_right_line = None
-                                    
-                                self.latest_right_line = None
+                        if right_line is not None:
+                            if previous_right_line is None or not np.array_equal(np.array(right_line), np.array(previous_right_line)):
+                                logger.debug(f"Right line detected: {right_line}")
+                                previous_right_line = right_line
+                        elif previous_right_line is not None:
+                            logger.debug("Right line lost")
+                            previous_right_line = None
                     
                     # Get targeting latency information (only log occasionally)
                     if time.time() % 10 < 0.1:  # Every ~10 seconds
-                        pipeline_latency = self.nt_client.getNumber('tl', 0)
-                        capture_latency = self.nt_client.getNumber('cl', 0)
-                        total_latency = pipeline_latency + capture_latency
-                        logger.info(f"Pipeline latency: {pipeline_latency}ms, Capture latency: {capture_latency}ms, Total: {total_latency}ms")
+                        ll = self.line_detector.manager.ll
+                        nt_client = self.line_detector.manager.nt_client
+                        if nt_client is not None:
+                            pipeline_latency = nt_client.getNumber('tl', 0)
+                            capture_latency = nt_client.getNumber('cl', 0)
+                            total_latency = pipeline_latency + capture_latency
+                            logger.info(f"Pipeline latency: {pipeline_latency}ms, Capture latency: {capture_latency}ms, Total: {total_latency}ms")
                     
                     # Reset error counter on successful iteration
                     error_counter = 0
@@ -258,7 +164,7 @@ class LineDetector:
                     
                     # Only log errors if they persist or after cooldown period
                     if error_counter >= max_consecutive_errors or error_cooldown <= 0:
-                        logger.error(f"Error fetching NetworkTables data: {e}")
+                        logger.error(f"Error fetching line data: {e}")
                         error_cooldown = Config.THREADING['error_log_cooldown']
                     
                     error_cooldown -= 1
@@ -269,50 +175,30 @@ class LineDetector:
         # Start the thread
         data_thread = threading.Thread(target=fetch_data_continuously, daemon=True)
         data_thread.start()
-        logger.info("Started NetworkTables data fetching thread")
+        logger.info("Started data fetching thread")
         
     def update_detection_params(self, params):
-        """Update detection parameters via NetworkTables and HTTP API"""
+        """Update detection parameters via the line detector"""
         try:
-            # Update parameters via NetworkTables for camera settings
-            if 'exposure' in params:
-                self.nt_client.putNumber('exposure', params.get('exposure', Config.CAMERA['exposure']))
-            if 'brightness' in params:
-                self.nt_client.putNumber('brightness', params.get('brightness', Config.CAMERA['brightness']))
-            if 'gain' in params:
-                self.nt_client.putNumber('gain', params.get('gain', Config.CAMERA['gain']))
-                
-            logger.info("Camera parameters updated via NetworkTables")
+            # Update parameters via the line detector
+            success = self.line_detector.update_detection_params(params)
             
-            # For Python-specific parameters, use HTTP
-            if 'threshold_min' in params:
-                python_params = {
-                    'threshold_min': params.get('threshold_min', Config.CAMERA['threshold_min'])
-                }
+            if success:
+                logger.info("Detection parameters updated successfully")
+            else:
+                logger.warning("Failed to update some detection parameters")
                 
-                import requests
-                response = requests.post(
-                    f'http://{self.limelight_address}:5801/pythonconfig',
-                    json=python_params,
-                    timeout=2
-                )
-                
-                if response.status_code == 200:
-                    logger.info("Python parameters updated successfully")
-                else:
-                    logger.warning(f"Python parameter update failed: {response.status_code}")
-                
-            return True
+            return success
         except Exception as e:
             logger.error(f"Error updating parameters: {e}")
             return False
     
     def get_processed_image(self):
         """Get an image with detected lines and green track area"""
-        # Get the latest image from Limelight
-        raw_image = get_latest_image(self.ll)
+        # Get the latest image from line detector
+        raw_image = self.line_detector.get_latest_image()
         
-        if (raw_image is None):
+        if raw_image is None:
             # Create a fallback image if Limelight image isn't available
             raw_image = np.zeros((480, 640, 3), dtype=np.uint8)
             cv2.putText(raw_image, "No camera feed available", (120, 240), 
@@ -433,11 +319,11 @@ class LineDetector:
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
         finally:
-            # Cleanup using the centralized disconnect function
-            if self.ll:
+            # Clean disconnect
+            if self.line_detector:
                 try:
-                    disconnect(self.ll, self.nt_client)
-                    logger.info("Disconnected from Limelight")
+                    self.line_detector.disconnect()
+                    logger.info("Line detector disconnected")
                 except Exception as e:
                     logger.error(f"Error during disconnect: {e}")
             logger.info("Program terminated")
@@ -447,6 +333,6 @@ if __name__ == "__main__":
     print("White Line Detection System (Pipeline #1)")
     print("=================================================")
     
-    # Create and run the detector
-    detector = LineDetector()
-    detector.run()
+    # Create and run the application
+    app = MainApplication()
+    app.run()

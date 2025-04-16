@@ -1,0 +1,21 @@
+# Core requirements
+numpy>=1.19.0
+opencv-python>=4.2.0.0
+flask>=2.0.0
+matplotlib>=3.7.0
+scipy
+
+# Limelight SDK
+limelightlib-python
+
+# NetworkTables for FRC communication
+pynetworktables
+
+# Optional improvements for Raspberry Pi
+# Used for system monitoring and improved web server performance
+psutil>=5.8.0
+eventlet>=0.30.0  # Better async handling for Flask
+
+# Alternative web server backends (install one)
+# gevent>=21.8.0  # Install this for better Flask server performance
+# gunicorn>=20.1.0  # Alternative production web server

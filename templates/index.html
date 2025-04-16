@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Track Line Detection Visualization</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #222;
+            color: #fff;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .container {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 20px;
+        }
+        .video-container {
+            background-color: #333;
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+        }
+        img.live-feed {
+            max-width: 100%;
+            border-radius: 4px;
+            margin-top: 10px;
+        }
+        h2 {
+            margin-top: 0;
+            color: #4CAF50;
+        }
+        .status {
+            margin-top: 20px;
+            background-color: #333;
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+        }
+        .progress-bar-container {
+            width: 100%;
+            background-color: #444;
+            border-radius: 4px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        
+        #progress-bar {
+            height: 20px;
+            background-color: #4CAF50;
+            width: 0%;
+            transition: width 0.5s ease-in-out;
+        }
+        
+        #mapping-status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+            background-color: #222;
+        }
+        
+        #mapping-status.complete #progress-bar {
+            background-color: #8BC34A;
+        }
+        
+        #mapping-status h3 {
+            color: #4CAF50;
+            margin-top: 0;
+        }
+        
+        .help-text {
+            font-size: 0.9em;
+            color: #aaa;
+            margin-top: 5px;
+        }
+        
+        .direct-stream-link {
+            display: block;
+            margin-top: 15px;
+            background-color: #2a2a2a;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        
+        .direct-stream-link a {
+            color: #4CAF50;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        
+        .direct-stream-link a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <h1>Track Line Detection Visualization</h1>
+    
+    <div class="container">
+        <div class="video-container">
+            <h2>Raw Camera Feed</h2>
+            <img src="http://limelight.local:5800 " alt="Raw Camera Feed" class="live-feed">
+            <p class="help-text">Live camera input from the robot</p>
+            <div class="direct-stream-link">
+                <a href="http://{{ limelight_address }}:5800/" target="_blank">View Direct Limelight Stream</a>
+                <p class="help-text">Access the raw Limelight camera stream</p>
+            </div>
+        </div>
+        
+        <div class="video-container">
+            <h2>White Line Detection</h2>
+            <img src="{{ url_for('video_processed') }}" alt="Processed Image" class="live-feed">
+            <p class="help-text">Green: Inner boundary, Red: Outer boundary</p>
+        </div>
+        
+        <div class="video-container">
+            <h2>Track Map</h2>
+            <img src="{{ url_for('track_map') }}?nocache={{ now }}" alt="Track Map" class="live-feed" id="track-map-image" onerror="handleMapError()">
+            <p class="help-text">Real-time track visualization from detected white lines</p>
+            <div id="map-error" style="display: none; color: red; margin-top: 10px; padding: 5px; background-color: #333;">
+                Error loading track map. Attempting to reload...
+            </div>
+        </div>
+    </div>
+    
+    <div class="status">
+        <h2>System Status</h2>
+        
+        <div id="mapping-status">
+            <h3>Track Mapping Status</h3>
+            <div id="mapping-progress">
+                <p id="mapping-time">Elapsed time: <span id="elapsed-time">0.0</span>s</p>
+                <p id="distance-info">Distance to start position: <span id="start-distance">--</span> pixels</p>
+                <p id="distance-traveled">Distance traveled: <span id="traveled">0</span> pixels</p>
+                <p id="completion-status">Status: <span id="status-text">Mapping in progress...</span></p>
+            </div>
+            <div class="progress-bar-container">
+                <div id="progress-bar"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Add current timestamp to script
+        const now = Date.now();
+        
+        // Handle track map loading errors
+        function handleMapError() {
+            console.error("Failed to load track map image");
+            document.getElementById('map-error').style.display = 'block';
+            
+            // Attempt to reload the image after a delay
+            setTimeout(() => {
+                const img = document.getElementById('track-map-image');
+                if (img) {
+                    img.src = "{{ url_for('track_map') }}?nocache=" + Date.now();
+                }
+            }, 2000);
+        }
+        
+        // Update status info from server
+        function updateStatus() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('elapsed-time').textContent = data.elapsed_time.toFixed(1);
+                    document.getElementById('start-distance').textContent = data.distance_to_start.toFixed(2);
+                    document.getElementById('traveled').textContent = data.distance_traveled.toFixed(2);
+                    document.getElementById('status-text').textContent = data.status;
+                    
+                    // Update progress bar based on mapping progress metrics
+                    const progressBar = document.getElementById('progress-bar');
+                    
+                    // Use a combination of elapsed time and distance to start for progress
+                    // As the robot approaches the start position, this will increase
+                    const maxDistanceExpected = 1000; // Expected maximum distance in pixels
+                    const completionProgress = Math.min(100, 100 - ((data.distance_to_start / maxDistanceExpected) * 100));
+                    
+                    // Blend time and completion progress
+                    const timeProgress = Math.min(100, (data.elapsed_time / 300) * 100);
+                    const blendedProgress = data.mapping_complete ? 100 : Math.max(timeProgress, completionProgress);
+                    
+                    progressBar.style.width = `${blendedProgress}%`;
+                    
+                    // Change progress bar color based on progress
+                    if (blendedProgress < 33) {
+                        progressBar.style.backgroundColor = '#4CAF50'; // Green
+                    } else if (blendedProgress < 66) {
+                        progressBar.style.backgroundColor = '#FFC107'; // Yellow/Amber
+                    } else {
+                        progressBar.style.backgroundColor = '#FF5722'; // Orange/Red
+                    }
+                    
+                    if (data.mapping_complete) {
+                        document.getElementById('mapping-status').classList.add('complete');
+                        progressBar.style.backgroundColor = '#8BC34A'; // Light green for completion
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching status:', error);
+                });
+        }
+        
+        // Force reload images if they stall
+        function checkAndReloadImages() {
+            const liveFeeds = document.querySelectorAll('.live-feed');
+            liveFeeds.forEach(img => {
+                // Add a timestamp parameter to force reload
+                const timestamp = new Date().getTime();
+                const currentSrc = img.src.split('?')[0]; // Remove any existing query
+                img.src = `${currentSrc}?t=${timestamp}`;
+            });
+        }
+        
+        // Update every 1 second
+        setInterval(updateStatus, 1000);
+        
+        // Check and reload images every 5 seconds if needed
+        setInterval(checkAndReloadImages, 5000);
+        
+        // Initial update
+        updateStatus();
+    </script>
+</body>
+</html>
